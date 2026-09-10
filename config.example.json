@@ -1,0 +1,263 @@
+const mineflayer = require('mineflayer');
+
+/**
+ * One managed account for signal-afk v2.
+ * Adds on top of v1 (anti-AFK + auto-reconnect):
+ *   - chat/command send
+ *   - manual movement (forward/back/left/right/jump/sneak + turn)
+ *   - live inventory (updates on pickup), drop + rearrange
+ *   - full disconnect that FREES the account (so you can log in on your PC), + reconnect
+ *   - on-demand top-down minimap scan
+ *   - per-account server (host/port/version) + swap server
+ *
+ * onUpdate(state)      -> status/health/pos/etc (throttled elsewhere)
+ * onInventory(inv)     -> array of {slot,name,count,displayName}
+ */
+function createBot(account, settings, onUpdate, onInventory) {
+  const name = account.label || account.username;
+
+  // per-account server overrides fall back to global settings
+  const srv = () => ({
+    host: account.host || settings.host,
+    port: account.port || settings.port || 25565,
+    version: account.version || settings.version || false,
+  });
+
+  const state = {
+    username: account.username,
+    label: name,
+    host: srv().host,
+    status: 'connecting', // connecting|online|offline|kicked|error|disconnected|stopped
+    health: null, food: null, pos: null, yaw: null,
+    dimension: null,
+    lastChat: '', connectedAt: null, uptime: 0, reconnects: 0, error: null,
+    controls: { forward:false, back:false, left:false, right:false, jump:false, sneak:false, sprint:false },
+    antiAfk: true,
+  };
+
+  let bot = null;
+  let antiAfkTimer = null;
+  let reconnectTimer = null;
+  let manualStop = false;      // true = user disconnected on purpose, do NOT auto-reconnect
+  let invTimer = null;
+
+  const push = () => onUpdate({ ...state });
+  const log = (m) => console.log(`[${name}] ${m}`);
+
+  function snapshotInventory() {
+    if (!bot || !bot.inventory) return [];
+    const out = [];
+    const slots = bot.inventory.slots || [];
+    for (let i = 0; i < slots.length; i++) {
+      const it = slots[i];
+      if (it) out.push({ slot: i, name: it.name, count: it.count, displayName: it.displayName });
+    }
+    return out;
+  }
+  function pushInventory() {
+    if (!onInventory) return;
+    onInventory({ username: account.username, slots: snapshotInventory() });
+  }
+  // throttle: inventory can fire many updateSlot events at once
+  function scheduleInvPush() {
+    if (invTimer) return;
+    invTimer = setTimeout(() => { invTimer = null; pushInventory(); }, 250);
+  }
+
+  function startAntiAfk() {
+    stopAntiAfk();
+    if (!state.antiAfk) return;
+    const every = (settings.antiAfkIntervalSec || 40) * 1000;
+    antiAfkTimer = setInterval(() => {
+      if (!bot || !bot.entity || !state.antiAfk) return;
+      // don't fight the user's held controls
+      const held = Object.entries(state.controls).some(([k, v]) => v && k !== 'sprint');
+      if (held) return;
+      try {
+        bot.look(Math.random() * Math.PI * 2, (Math.random() - 0.5) * Math.PI, false);
+        bot.setControlState('jump', true);
+        setTimeout(() => bot && bot.setControlState('jump', false), 500);
+        const dirs = ['forward', 'back', 'left', 'right'];
+        const d = dirs[Math.floor(Math.random() * dirs.length)];
+        bot.setControlState(d, true);
+        setTimeout(() => bot && bot.setControlState(d, false), 700);
+        if (settings.antiAfkCommand) bot.chat(settings.antiAfkCommand);
+      } catch (_) {}
+    }, every);
+  }
+  function stopAntiAfk() {
+    if (antiAfkTimer) clearInterval(antiAfkTimer);
+    antiAfkTimer = null;
+  }
+
+  function scheduleReconnect() {
+    if (manualStop || reconnectTimer) return;
+    state.reconnects += 1;
+    push();
+    const delay = (settings.reconnectDelaySec || 15) * 1000;
+    reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, delay);
+  }
+
+  function connect() {
+    manualStop = false;
+    const s = srv();
+    state.host = s.host;
+    state.status = 'connecting';
+    state.error = null;
+    push();
+
+    bot = mineflayer.createBot({
+      host: s.host,
+      port: s.port,
+      username: account.username,
+      auth: 'microsoft',
+      version: s.version,
+      profilesFolder: settings.profilesFolder || './auth-cache',
+      hideErrors: false,
+    });
+
+    bot.on('login', () => { state.status = 'online'; state.connectedAt = Date.now(); log('logged in'); push(); });
+
+    bot.on('spawn', () => {
+      state.status = 'online';
+      state.dimension = bot.game && bot.game.dimension;
+      startAntiAfk();
+      // reapply any controls the user left on
+      Object.entries(state.controls).forEach(([k, v]) => { try { bot.setControlState(k, v); } catch (_) {} });
+      if (settings.joinCommands) {
+        settings.joinCommands.forEach((c, i) => setTimeout(() => { try { bot.chat(c); } catch (_) {} }, 1500 + i * 1200));
+      }
+      pushInventory();
+      push();
+    });
+
+    bot.on('health', () => { state.health = Math.round(bot.health); state.food = Math.round(bot.food); push(); });
+
+    bot.on('move', () => {
+      if (bot.entity) {
+        const p = bot.entity.position;
+        state.pos = { x: Math.round(p.x), y: Math.round(p.y), z: Math.round(p.z) };
+        state.yaw = bot.entity.yaw;
+      }
+    });
+
+    bot.on('message', (json) => { const t = json.toString().trim(); if (t) { state.lastChat = t.slice(0, 200); push(); } });
+
+    bot.on('playerCollect', (collector) => { if (collector && bot.entity && collector.username === bot.username) scheduleInvPush(); });
+    if (bot.inventory) bot.inventory.on('updateSlot', scheduleInvPush);
+
+    bot.on('death', () => { log('died'); if (settings.respawn !== false) { try { bot.chat('/respawn'); } catch (_) {} } });
+
+    bot.on('kicked', (reason) => {
+      state.status = 'kicked'; state.error = String(reason).slice(0, 240);
+      log('kicked: ' + state.error); stopAntiAfk(); push(); scheduleReconnect();
+    });
+
+    bot.on('end', (reason) => {
+      stopAntiAfk();
+      if (manualStop) { state.status = 'disconnected'; push(); }   // freed on purpose
+      else { state.status = 'offline'; log('disconnected: ' + reason); push(); scheduleReconnect(); }
+    });
+
+    bot.on('error', (err) => { state.status = 'error'; state.error = String(err.message || err).slice(0, 240); log('error: ' + state.error); push(); });
+  }
+
+  setInterval(() => {
+    if (state.status === 'online' && state.connectedAt) {
+      state.uptime = Math.floor((Date.now() - state.connectedAt) / 1000);
+      push();
+    }
+  }, 5000);
+
+  connect();
+
+  // ---- control API used by the dashboard ----
+  return {
+    getState: () => ({ ...state }),
+    getInventory: () => ({ username: account.username, slots: snapshotInventory() }),
+
+    say: (msg) => { if (bot && state.status === 'online' && msg) { try { bot.chat(String(msg).slice(0, 256)); } catch (_) {} } },
+
+    setControl: (control, active) => {
+      if (!(control in state.controls)) return;
+      state.controls[control] = !!active;
+      if (bot) { try { bot.setControlState(control, !!active); } catch (_) {} }
+      push();
+    },
+    clearControls: () => {
+      Object.keys(state.controls).forEach((k) => {
+        state.controls[k] = false;
+        if (bot) { try { bot.setControlState(k, false); } catch (_) {} }
+      });
+      push();
+    },
+    // turn the view; dyaw in radians (+ = right), dpitch optional
+    turn: (dyaw, dpitch) => {
+      if (!bot || !bot.entity) return;
+      try { bot.look(bot.entity.yaw - (dyaw || 0), bot.entity.pitch + (dpitch || 0), false); } catch (_) {}
+    },
+
+    dropSlot: (slot, all) => {
+      if (!bot || !bot.inventory) return;
+      const it = bot.inventory.slots[slot];
+      if (!it) return;
+      try {
+        if (all) bot.tossStack(it).catch(() => {});
+        else bot.toss(it.type, it.metadata == null ? null : it.metadata, 1).catch(() => {});
+      } catch (_) {}
+    },
+    moveSlot: (from, to) => {
+      if (!bot) return;
+      try { bot.moveSlotItem(from, to).catch(() => { scheduleInvPush(); }).then(() => scheduleInvPush()); } catch (_) {}
+    },
+
+    setAntiAfk: (on) => { state.antiAfk = !!on; if (on) startAntiAfk(); else stopAntiAfk(); push(); },
+
+    setServer: (host, port, version) => {
+      account.host = host || account.host;
+      if (port) account.port = port;
+      if (version) account.version = version;
+      state.host = account.host || settings.host;
+    },
+
+    // full disconnect: closes the session so the account is FREE to use on your PC.
+    // will NOT auto-reconnect until you press reconnect.
+    disconnect: () => {
+      manualStop = true;
+      stopAntiAfk();
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      if (bot) { try { bot.quit('freed by dashboard'); } catch (_) {} }
+      state.status = 'disconnected';
+      push();
+    },
+    reconnect: () => { manualStop = false; if (bot) { try { bot.end(); } catch (_) {} } if (state.status === 'disconnected' || state.status === 'stopped') connect(); },
+    stop: () => {
+      manualStop = true; stopAntiAfk();
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      if (bot) { try { bot.quit(); } catch (_) {} }
+      state.status = 'stopped'; push();
+    },
+    start: () => { manualStop = false; connect(); },
+
+    // top-down minimap: highest solid block per column around the bot
+    scanMap: (radius) => {
+      if (!bot || !bot.entity) return null;
+      const r = Math.min(radius || 16, 28);
+      const c = bot.entity.position.floored();
+      const cols = [];
+      for (let dz = -r; dz <= r; dz++) {
+        for (let dx = -r; dx <= r; dx++) {
+          let found = null;
+          for (let dy = 20; dy >= -20; dy--) {
+            const b = bot.blockAt(c.offset(dx, dy, 0).offset(0, 0, dz));
+            if (b && b.boundingBox === 'block' && b.name !== 'air') { found = { n: b.name, y: c.y + dy }; break; }
+          }
+          cols.push(found ? { x: dx, z: dz, n: found.n, y: found.y } : { x: dx, z: dz, n: null });
+        }
+      }
+      return { r, center: { x: c.x, y: c.y, z: c.z }, yaw: bot.entity.yaw, cols };
+    },
+  };
+}
+
+module.exports = { createBot };

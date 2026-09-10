@@ -1,0 +1,132 @@
+const fs = require('fs');
+const path = require('path');
+const http = require('http');
+const express = require('express');
+const { Server } = require('socket.io');
+const { createBot } = require('./bot');
+
+const CONFIG_PATH = path.join(__dirname, '..', 'config.json');
+if (!fs.existsSync(CONFIG_PATH)) {
+  console.error('Missing config.json — copy config.example.json to config.json and edit it.');
+  process.exit(1);
+}
+let config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+const settings = config.settings || {};
+config.accounts = config.accounts || [];
+
+function saveConfig() {
+  try { fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2)); }
+  catch (e) { console.error('config save failed:', e.message); }
+}
+
+// ---- item/block textures via minecraft-assets (low quality is fine) ----
+const ICONS = {};
+try {
+  const mcAssets = require('minecraft-assets');
+  // pick a supported version close to the server version
+  const want = String(settings.version || '1.21.1');
+  const supported = (mcAssets.versions || []).slice();
+  let use = supported.includes(want) ? want
+    : supported.find((v) => v.startsWith(want.split('.').slice(0, 2).join('.')))
+    || supported[supported.length - 1];
+  const a = mcAssets(use);
+  const tc = a && a.textureContent;
+  if (tc) for (const k of Object.keys(tc)) { if (tc[k] && tc[k].texture) ICONS[k] = tc[k].texture; }
+  console.log(`Loaded ${Object.keys(ICONS).length} textures from minecraft-assets ${use}`);
+} catch (e) {
+  console.warn('minecraft-assets not available, icons disabled:', e.message);
+}
+
+const bots = {};
+const states = {};
+const inventories = {};
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+
+app.use(express.static(path.join(__dirname, '..', 'public')));
+app.get('/icons.json', (_req, res) => res.json(ICONS));
+
+io.use((socket, next) => {
+  if (!settings.dashboardPassword) return next();
+  const pw = socket.handshake.auth && socket.handshake.auth.password;
+  if (pw === settings.dashboardPassword) return next();
+  next(new Error('unauthorized'));
+});
+
+function spawnBot(acc) {
+  bots[acc.username] = createBot(
+    acc, settings,
+    (s) => { states[acc.username] = s; io.emit('state', s); },
+    (inv) => { inventories[inv.username] = inv; io.emit('inventory', inv); }
+  );
+  states[acc.username] = bots[acc.username].getState();
+}
+
+io.on('connection', (socket) => {
+  socket.emit('states', states);
+  socket.emit('inventories', inventories);
+
+  const b = (u) => bots[u];
+
+  socket.on('reconnectBot', (u) => b(u) && b(u).reconnect());
+  socket.on('disconnectBot', (u) => b(u) && b(u).disconnect());
+  socket.on('stopBot', (u) => b(u) && b(u).stop());
+  socket.on('startBot', (u) => b(u) && b(u).start());
+
+  socket.on('chat', ({ u, msg }) => b(u) && b(u).say(msg));
+  socket.on('control', ({ u, control, active }) => b(u) && b(u).setControl(control, active));
+  socket.on('clearControls', (u) => b(u) && b(u).clearControls());
+  socket.on('turn', ({ u, dyaw, dpitch }) => b(u) && b(u).turn(dyaw, dpitch));
+  socket.on('setAntiAfk', ({ u, on }) => b(u) && b(u).setAntiAfk(on));
+
+  socket.on('dropSlot', ({ u, slot, all }) => b(u) && b(u).dropSlot(slot, all));
+  socket.on('moveSlot', ({ u, from, to }) => b(u) && b(u).moveSlot(from, to));
+  socket.on('getInventory', (u, cb) => { if (b(u)) { const inv = b(u).getInventory(); io.emit('inventory', inv); if (cb) cb(inv); } });
+
+  socket.on('scanMap', ({ u, radius }, cb) => { if (b(u)) { const m = b(u).scanMap(radius); if (cb) cb(m); } });
+
+  // change one account's server and reconnect it
+  socket.on('setServer', ({ u, host, port, version }) => {
+    if (!b(u)) return;
+    b(u).setServer(host, Number(port) || undefined, version || undefined);
+    const acc = config.accounts.find((a) => a.username === u);
+    if (acc) { acc.host = host; if (port) acc.port = Number(port); if (version) acc.version = version; saveConfig(); }
+    b(u).reconnect();
+  });
+
+  // add a new account (spawns immediately)
+  socket.on('addAccount', ({ username, label, host, port, version }, cb) => {
+    username = (username || '').trim();
+    if (!username) { if (cb) cb({ ok: false, error: 'username/email required' }); return; }
+    if (config.accounts.find((a) => a.username === username)) { if (cb) cb({ ok: false, error: 'already exists' }); return; }
+    const acc = { username, label: (label || '').trim() || username };
+    if (host) acc.host = host;
+    if (port) acc.port = Number(port);
+    if (version) acc.version = version;
+    config.accounts.push(acc);
+    saveConfig();
+    spawnBot(acc);
+    io.emit('state', states[acc.username]);
+    if (cb) cb({ ok: true });
+  });
+
+  // remove an account (stops it, drops from config)
+  socket.on('removeAccount', (u) => {
+    if (bots[u]) { try { bots[u].stop(); } catch (_) {} delete bots[u]; }
+    delete states[u]; delete inventories[u];
+    config.accounts = config.accounts.filter((a) => a.username !== u);
+    saveConfig();
+    io.emit('removed', u);
+  });
+});
+
+// stagger first spawn so device-code prompts (first run) print one at a time
+config.accounts.forEach((acc, i) => setTimeout(() => spawnBot(acc), i * 4000));
+
+const port = settings.dashboardPort || 3000;
+server.listen(port, '0.0.0.0', () => {
+  console.log(`\nDashboard:  http://<your-vps-ip>:${port}`);
+  console.log(`Password:   ${settings.dashboardPassword ? '(set in config.json)' : '(none — set dashboardPassword!)'}\n`);
+});
