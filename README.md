@@ -1,7 +1,7 @@
 {
   "name": "signal-afk",
   "version": "2.0.0",
-  "description": "Headless multi-account Minecraft client with phone dashboard: chat, movement, inventory, minimap.",
+  "description":  multi-account Minecraft clientdashboard: chat, movement, inventory, minimap.",
   "main": "src/index.js",
   "scripts": { "start": "node src/index.js" },
   "dependencies": {
